@@ -119,7 +119,7 @@ export const syncWeeklyAdminTrips = database
     if (before === after) return null;
 
     // Solo nos interesan estos estados finales
-        if (
+    if (
       after !== 'completado' &&
       after !== 'completado_sin_pago' &&
       after !== 'cancelado'
@@ -149,7 +149,7 @@ export const syncWeeklyAdminTrips = database
 
     const updates: Record<string, any> = {};
 
-        if (after === 'completado' || after === 'completado_sin_pago') {
+    if (after === 'completado' || after === 'completado_sin_pago') {
       updates[completedPath] = buildCompletedPayload(viaje);
     }
 
@@ -193,12 +193,21 @@ async function getTokens(
   uid: string
 ): Promise<string[]> {
   const userId = uid.trim();
+
   if (userId.length === 0) {
+    console.log("[getTokens] UID vacío", { roleNode, uid });
     return [];
   }
 
-  const snap = await db.ref(`PushTokens/${roleNode}/${userId}`).get();
+  const path = `PushTokens/${roleNode}/${userId}`;
+  const snap = await db.ref(path).get();
+
   if (!snap.exists()) {
+    console.log("[getTokens] No existen tokens", {
+      roleNode,
+      userId,
+      path,
+    });
     return [];
   }
 
@@ -219,6 +228,12 @@ async function getTokens(
     if (token.length > 0 && active) {
       tokens.add(token);
     }
+  });
+
+  console.log("[getTokens] Tokens encontrados", {
+    roleNode,
+    userId,
+    total: tokens.size,
   });
 
   return Array.from(tokens);
@@ -262,12 +277,20 @@ async function sendPushToUser(
   payload: PushPayload
 ): Promise<void> {
   const userId = uid.trim();
+
   if (userId.length === 0) {
+    console.log("[sendPushToUser] UID vacío", { roleNode, payload });
     return;
   }
 
   const tokens = await getTokens(roleNode, userId);
+
   if (tokens.length === 0) {
+    console.log("[sendPushToUser] Sin tokens para usuario", {
+      roleNode,
+      userId,
+      payload,
+    });
     return;
   }
 
@@ -292,24 +315,58 @@ async function sendPushToUser(
         priority: "high",
         notification: {
           channelId: payload.channelId,
+          sound: "default",
+        },
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: "default",
+          },
         },
       },
     });
 
-    response.responses.forEach((item: { success: boolean; error?: { code?: string } }, index: number) => {
-      if (item.success) {
-        return;
-      }
-
-      const code = item.error?.code ?? "";
-      const isInvalid =
-        code === "messaging/invalid-registration-token" ||
-        code === "messaging/registration-token-not-registered";
-
-      if (isInvalid) {
-        invalidTokens.push(batch[index]);
-      }
+    console.log("[sendPushToUser] Resultado FCM", {
+      roleNode,
+      userId,
+      type: payload.type,
+      successCount: response.successCount,
+      failureCount: response.failureCount,
     });
+
+    response.responses.forEach(
+      (
+        item: {
+          success: boolean;
+          error?: {
+            code?: string;
+            message?: string;
+          };
+        },
+        index: number,
+      ) => {
+        if (item.success) {
+          return;
+        }
+
+        const code = item.error?.code ?? "";
+        console.error("[sendPushToUser] Error FCM", {
+          roleNode,
+          userId,
+          code,
+          message: item.error?.message,
+        });
+
+        const isInvalid =
+          code === "messaging/invalid-registration-token" ||
+          code === "messaging/registration-token-not-registered";
+
+        if (isInvalid) {
+          invalidTokens.push(batch[index]);
+        }
+      },
+    );
   }
 
   await removeInvalidTokens(roleNode, userId, invalidTokens);
@@ -831,7 +888,7 @@ export const notifyTripStatusChanged = database
         return null;
       }
 
-            if (
+      if (
         (afterStatus === "completado" || afterStatus === "completado_sin_pago") &&
         clienteId.length > 0
       ) {
@@ -892,6 +949,108 @@ export const notifyTripStatusChanged = database
 
       return null;
     }
+  );
+
+async function getEligibleDriversForTrip(
+  viaje: Record<string, unknown>,
+): Promise<string[]> {
+  const zonaId = asTrimmedString(viaje.zonaId);
+
+  if (!zonaId) {
+    console.log("[getEligibleDriversForTrip] Viaje sin zonaId", viaje);
+    return [];
+  }
+
+  const snap = await db.ref("Conductores")
+    .orderByChild("zonaId")
+    .equalTo(zonaId)
+    .get();
+
+  if (!snap.exists()) {
+    console.log("[getEligibleDriversForTrip] Sin conductores en zona", {
+      zonaId,
+    });
+    return [];
+  }
+
+  const drivers = snap.val() as Record<string, Record<string, unknown>>;
+  const eligibleDriverIds: string[] = [];
+
+  Object.entries(drivers).forEach(([conductorId, conductor]) => {
+    const estatus = asTrimmedString(
+      conductor.estatus || conductor.estado,
+    ).toLowerCase();
+
+    const isActive =
+      estatus === "activo" ||
+      estatus === "disponible" ||
+      estatus === "online";
+
+    if (isActive) {
+      eligibleDriverIds.push(conductorId);
+    }
+  });
+
+  return eligibleDriverIds;
+}
+
+export const notifyNewTripRequest = database
+  .ref("TAXI_Viaje/{viajeId}")
+  .onCreate(
+    async (
+      snapshot: DataSnapshot,
+      context: EventContext,
+    ): Promise<null> => {
+      const viajeId = context.params.viajeId as string;
+      const viaje = asMap(snapshot.val());
+
+      const estatus = asTrimmedString(viaje.estatus).toLowerCase();
+
+      console.log("[notifyNewTripRequest] Viaje creado", {
+        viajeId,
+        estatus,
+        zonaId: viaje.zonaId ?? null,
+      });
+
+      if (estatus !== "solicitud") {
+        console.log("[notifyNewTripRequest] Ignorado por estatus", {
+          viajeId,
+          estatus,
+        });
+        return null;
+      }
+
+      const conductorIds = await getEligibleDriversForTrip(viaje);
+
+      console.log("[notifyNewTripRequest] Conductores elegibles", {
+        viajeId,
+        total: conductorIds.length,
+        conductorIds,
+      });
+
+      if (conductorIds.length === 0) {
+        return null;
+      }
+
+      await Promise.all(
+        conductorIds.map((conductorId) =>
+          sendPushToUser(
+            "conductores",
+            conductorId,
+            buildTripPayload({
+              type: "new_trip_request",
+              viajeId,
+              targetRole: "conductor",
+              title: "Nueva solicitud disponible",
+              body: "Tienes una nueva solicitud de viaje disponible.",
+              channelId: "trip_requests",
+            }),
+          ),
+        ),
+      );
+
+      return null;
+    },
   );
 
 // =========================
@@ -1375,7 +1534,7 @@ export const markTripRatingPendingOnCompleted = database
       return null;
     }
   );
-  export const recalculateDriverRating = database
+export const recalculateDriverRating = database
   .ref("ConductoresCalificaciones/{conductorId}/calificaciones/{viajeId}")
   .onWrite(
     async (
@@ -1394,7 +1553,7 @@ export const markTripRatingPendingOnCompleted = database
       return null;
     }
   );
-  export const recalculateClientRating = database
+export const recalculateClientRating = database
   .ref("ClientesCalificaciones/{clienteId}/calificaciones/{viajeId}")
   .onWrite(
     async (
