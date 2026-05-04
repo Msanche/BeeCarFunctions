@@ -13,12 +13,15 @@ type SeleccionOferta = {
   createdAt?: number | object;
 };
 
-type PushRole = "clientes" | "conductores";
+type PushRole = "clientes" | "conductores" | "administradores";
 
 type PushPayload = {
   type: string;
-  viajeId: string;
-  targetRole: "cliente" | "conductor";
+  viajeId?: string;
+  transactionId?: string;
+  conductorId?: string;
+  clienteId?: string;
+  targetRole: "cliente" | "conductor" | "manager";
   title: string;
   body: string;
   clickAction: string;
@@ -277,19 +280,16 @@ async function sendPushToUser(
   payload: PushPayload
 ): Promise<void> {
   const userId = uid.trim();
-
   if (userId.length === 0) {
-    console.log("[sendPushToUser] UID vacío", { roleNode, payload });
     return;
   }
 
   const tokens = await getTokens(roleNode, userId);
-
   if (tokens.length === 0) {
-    console.log("[sendPushToUser] Sin tokens para usuario", {
+    console.log("[sendPushToUser] Sin tokens", {
       roleNode,
       userId,
-      payload,
+      type: payload.type,
     });
     return;
   }
@@ -306,7 +306,10 @@ async function sendPushToUser(
       },
       data: {
         type: payload.type,
-        viajeId: payload.viajeId,
+        viajeId: payload.viajeId ?? "",
+        transactionId: payload.transactionId ?? "",
+        conductorId: payload.conductorId ?? "",
+        clienteId: payload.clienteId ?? "",
         targetRole: payload.targetRole,
         clickAction: payload.clickAction,
         channelId: payload.channelId,
@@ -335,42 +338,252 @@ async function sendPushToUser(
       failureCount: response.failureCount,
     });
 
-    response.responses.forEach(
-      (
-        item: {
-          success: boolean;
-          error?: {
-            code?: string;
-            message?: string;
-          };
-        },
-        index: number,
-      ) => {
-        if (item.success) {
-          return;
-        }
+    response.responses.forEach((item, index) => {
+      if (item.success) return;
 
-        const code = item.error?.code ?? "";
-        console.error("[sendPushToUser] Error FCM", {
-          roleNode,
-          userId,
-          code,
-          message: item.error?.message,
-        });
+      const code = item.error?.code ?? "";
+      console.error("[sendPushToUser] Error FCM", {
+        roleNode,
+        userId,
+        code,
+        message: item.error?.message,
+      });
 
-        const isInvalid =
-          code === "messaging/invalid-registration-token" ||
-          code === "messaging/registration-token-not-registered";
-
-        if (isInvalid) {
-          invalidTokens.push(batch[index]);
-        }
-      },
-    );
+      if (
+        code === "messaging/invalid-registration-token" ||
+        code === "messaging/registration-token-not-registered"
+      ) {
+        invalidTokens.push(batch[index]);
+      }
+    });
   }
 
   await removeInvalidTokens(roleNode, userId, invalidTokens);
 }
+
+async function getActiveAdminIds(): Promise<string[]> {
+  const snap = await db.ref("Administradores").get();
+
+  if (!snap.exists()) {
+    return [];
+  }
+
+  const admins = snap.val() as Record<string, Record<string, unknown>>;
+  const ids: string[] = [];
+
+  Object.entries(admins).forEach(([adminId, admin]) => {
+    const estatus = asTrimmedString(admin.estatus).toLowerCase();
+
+    if (estatus === "activo") {
+      ids.push(adminId);
+    }
+  });
+
+  return ids;
+}
+
+async function getClientName(clienteId: string): Promise<string> {
+  const snap = await db.ref(`Clientes/${clienteId}/nombre`).get();
+  const name = asTrimmedString(snap.val());
+
+  return name.length > 0 ? name : "Un cliente";
+}
+
+async function getDriverName(conductorId: string): Promise<string> {
+  const snap = await db.ref(`Conductores/${conductorId}/nombre`).get();
+  const name = asTrimmedString(snap.val());
+
+  return name.length > 0 ? name : "Un conductor";
+}
+
+function buildWalletPayload(params: {
+  type: string;
+  title: string;
+  body: string;
+  targetRole: "conductor" | "manager";
+  channelId: string;
+  clickAction: string;
+  transactionId: string;
+  conductorId: string;
+}): PushPayload {
+  return {
+    type: params.type,
+    title: params.title,
+    body: params.body,
+    targetRole: params.targetRole,
+    channelId: params.channelId,
+    clickAction: params.clickAction,
+    transactionId: params.transactionId,
+    conductorId: params.conductorId,
+  };
+}
+
+export const notifyManagerClientDepositPending = database
+  .ref("TransaccionesClientes/{clienteId}/transacciones/{transactionId}")
+  .onCreate(
+    async (
+      snapshot: DataSnapshot,
+      context: EventContext,
+    ): Promise<null> => {
+      const clienteId = context.params.clienteId as string;
+      const transactionId = context.params.transactionId as string;
+      const transaction = asMap(snapshot.val());
+
+      const estatus = asTrimmedString(transaction.estatus).toLowerCase();
+      const tipo = asTrimmedString(transaction.tipo).toLowerCase();
+
+      if (estatus !== "pendiente" || tipo !== "deposito") {
+        return null;
+      }
+
+      const adminIds = await getActiveAdminIds();
+      const clientName = await getClientName(clienteId);
+
+      console.log("[notifyManagerClientDepositPending]", {
+        clienteId,
+        transactionId,
+        totalAdmins: adminIds.length,
+      });
+
+      await Promise.all(
+        adminIds.map((adminId) =>
+          sendPushToUser("administradores", adminId, {
+            type: "client_deposit_pending",
+            transactionId,
+            clienteId,
+            targetRole: "manager",
+            title: "Depósito de cliente pendiente",
+            body: `${clientName} envió un comprobante de depósito a wallet.`,
+            clickAction: "OPEN_CLIENT_WALLET_DEPOSITS",
+            channelId: "wallet_deposits",
+          }),
+        ),
+      );
+
+      return null;
+    },
+  );
+
+  export const notifyClientDepositCompleted = database
+  .ref("TransaccionesClientes/{clienteId}/transacciones/{transactionId}/estatus")
+  .onWrite(
+    async (
+      change: Change<DataSnapshot>,
+      context: EventContext,
+    ): Promise<null> => {
+      const before = asTrimmedString(change.before.val()).toLowerCase();
+      const after = asTrimmedString(change.after.val()).toLowerCase();
+
+      if (before === after || after !== "completado") {
+        return null;
+      }
+
+      const clienteId = context.params.clienteId as string;
+      const transactionId = context.params.transactionId as string;
+
+      await sendPushToUser("clientes", clienteId, {
+        type: "client_deposit_completed",
+        transactionId,
+        clienteId,
+        targetRole: "cliente",
+        title: "Depósito aprobado",
+        body: "Tu depósito fue aprobado y ya se reflejó en tu wallet.",
+        clickAction: "OPEN_WALLET",
+        channelId: "wallet_deposits",
+      });
+
+      return null;
+    },
+  );
+
+export const notifyManagerDriverDepositPending = database
+  .ref("TransaccionesConductores/{conductorId}/transacciones/{transactionId}")
+  .onCreate(
+    async (
+      snapshot: DataSnapshot,
+      context: EventContext,
+    ): Promise<null> => {
+      const conductorId = context.params.conductorId as string;
+      const transactionId = context.params.transactionId as string;
+      const transaction = asMap(snapshot.val());
+
+      const estatus = asTrimmedString(transaction.estatus).toLowerCase();
+      const tipo = asTrimmedString(transaction.tipo).toLowerCase();
+
+      if (estatus !== "pendiente" || tipo !== "deposito") {
+        return null;
+      }
+
+      const adminIds = await getActiveAdminIds();
+
+      console.log("[notifyManagerDriverDepositPending]", {
+        conductorId,
+        transactionId,
+        totalAdmins: adminIds.length,
+      });
+
+      const conductorName = await getDriverName(conductorId);
+
+      await Promise.all(
+        adminIds.map((adminId) =>
+          sendPushToUser(
+            "administradores",
+            adminId,
+            {
+              type: "driver_deposit_pending",
+              transactionId,
+              conductorId,
+              targetRole: "manager",
+              title: "Depósito pendiente",
+              body: `${conductorName} envió un comprobante de depósito a wallet.`,
+              clickAction: "OPEN_DRIVER_WALLET_DEPOSITS",
+              channelId: "wallet_deposits",
+            },
+          ),
+        ),
+      );
+
+      return null;
+    },
+  );
+
+export const notifyDriverDepositCompleted = database
+  .ref("TransaccionesConductores/{conductorId}/transacciones/{transactionId}/estatus")
+  .onWrite(
+    async (
+      change: Change<DataSnapshot>,
+      context: EventContext,
+    ): Promise<null> => {
+      const before = asTrimmedString(change.before.val()).toLowerCase();
+      const after = asTrimmedString(change.after.val()).toLowerCase();
+
+      if (before === after || after !== "completado") {
+        return null;
+      }
+
+      const conductorId = context.params.conductorId as string;
+      const transactionId = context.params.transactionId as string;
+
+      await sendPushToUser(
+        "conductores",
+        conductorId,
+        buildWalletPayload({
+          type: "driver_deposit_completed",
+          title: "Depósito aprobado",
+          body: "Tu depósito fue aprobado y ya se reflejó en tu wallet.",
+          targetRole: "conductor",
+          channelId: "wallet_deposits",
+          clickAction: "OPEN_WALLET",
+          transactionId,
+          conductorId,
+        }),
+      );
+
+      return null;
+    },
+  );
+
+
 
 async function getViaje(viajeId: string): Promise<ViajeMap | null> {
   const snap = await db.ref(`TAXI_Viaje/${viajeId}`).get();
